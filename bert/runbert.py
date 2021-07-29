@@ -269,7 +269,8 @@ def main():
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     runname = "bert_test1"
-    bert_pretrain = "/work/kw/yuqing/torch_test/ChineseTextClassificationPytorch/paddle/downloadmodsel/huggingface/roberta-base-finetuned-chinanews-chinese/"
+    #bert_pretrain = "/work/pretrain/huggingface/roberta-base-finetuned-chinanews-chinese/"
+    bert_pretrain = "/work/pretrain/huggingface/ernie/"
     max_length = 512
     batch_size = 32
     epochs = 3
