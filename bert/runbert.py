@@ -14,6 +14,19 @@ from sklearn.model_selection import train_test_split
 import re
 import time
 import pickle
+import argparse
+
+##########################################
+## Options and defaults
+##########################################
+def getOptions():
+    parser = argparse.ArgumentParser(description='python *.py [option]')
+    parser.add_argument('--run', dest='run', help="run name", default='test1')
+    parser.add_argument('--pretrain', dest='pretrain', help="pretrain huggingface path", default='')
+    parser.add_argument('--device', dest='device', help="device", default='')
+    args = parser.parse_args()
+
+    return args
 
 def text_preprocessing(text):
     """
@@ -83,6 +96,7 @@ class BertClassifier(nn.Module):
         @param    freeze_bert (bool): Set `False` to fine-tune the BERT model
         """
         super(BertClassifier, self).__init__()
+
         # Specify hidden size of BERT, hidden size of our classifier, and number of labels
         D_in, H, D_out = 768, 50, 2
 
@@ -200,7 +214,7 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
         if evaluation == True:
             # After the completion of each training epoch, measure the model's performance
             # on our validation set.
-            val_loss, val_accuracy = evaluate(model, val_dataloader)
+            val_loss, val_accuracy = evaluate(model, val_dataloader,device=device)
 
             # Print performance over the entire training data
             time_elapsed = time.time() - t0_epoch
@@ -265,16 +279,23 @@ def compute_metrics(pred):
     return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
 
 def main():
+    options = getOptions()
+    print(options)
     seed = 2021
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    runname = "bert_test1"
+    runname = options.run
     #bert_pretrain = "/work/pretrain/huggingface/roberta-base-finetuned-chinanews-chinese/"
-    bert_pretrain = "/work/pretrain/huggingface/ernie/"
+    if not options.pretrain:
+        raise
+    bert_pretrain = options.pretrain
     max_length = 512
     batch_size = 32
     epochs = 3
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if not options.device:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(options.device)
     train_path = "/work/kw/yuqing/torch_test/train_paddle.tsv"
     valid_path = "/work/kw/yuqing/torch_test/test_paddle.tsv"
 
@@ -328,7 +349,7 @@ def main():
     model = train(model=model, train_dataloader=train_dataloader,
           val_dataloader=val_dataloader,
           optimizer=optimizer, scheduler=scheduler,
-          epochs=2, evaluation=True)
+          epochs=2, evaluation=True,device=device)
     #model.save_pretrained('./%s/model' % runname)
     tokenizer.save_pretrained('./%s/model' % runname)
 
