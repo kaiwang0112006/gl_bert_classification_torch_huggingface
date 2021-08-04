@@ -68,6 +68,7 @@ def preprocessing_for_bert(textdata, tokenizer, pad):
             add_special_tokens=True,        # Add `[CLS]` and `[SEP]`
             max_length=pad,                  # Max length to truncate/pad
             padding='max_length',         # Pad sentence to max length
+            truncation=True,
             return_tensors='pt',           # Return PyTorch tensor
             return_attention_mask=True      # Return attention mask
         )
@@ -96,9 +97,6 @@ class BertClassifier(nn.Module):
         @param    freeze_bert (bool): Set `False` to fine-tune the BERT model
         """
         super(BertClassifier, self).__init__()
-
-        # Specify hidden size of BERT, hidden size of our classifier, and number of labels
-        D_in, H, D_out = 768, 50, 2
 
         # Instantiate BERT model
         self.bert = BertModel.from_pretrained(model_path)
@@ -296,8 +294,8 @@ def main():
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device(options.device)
-    train_path = "/work/kw/yuqing/torch_test/train_paddle.tsv"
-    valid_path = "/work/kw/yuqing/torch_test/test_paddle.tsv"
+    train_path = "/work/kw/yuqing/torch_test/data/train_3c.tsv"
+    valid_path = "/work/kw/yuqing/torch_test/data/test_3c.tsv"
 
     # load dataset
     traindf = pd.read_csv(train_path,sep='\t')
