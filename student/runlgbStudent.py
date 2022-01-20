@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import BertModel
 import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
@@ -11,7 +12,7 @@ import numpy as np
 import random
 import sklearn.metrics
 from sklearn.model_selection import train_test_split
-from sklearn import metrics
+from lightgbm.sklearn import LGBMClassifier
 import re
 import time
 import pickle
@@ -21,6 +22,11 @@ import logging.config
 import os
 import sys
 import shutil
+import i3_word_tokenizer
+import re
+import string
+from sklearn.feature_extraction.text import CountVectorizer,TfidfTransformer
+import lightgbm as lgb
 
 ##########################################
 ## Options and defaults
@@ -127,7 +133,7 @@ class BertClassifier(nn.Module):
             for param in self.bert.parameters():
                 param.requires_grad = False
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask,weight):
         """
         Feed input to BERT and the classifier to compute logits.
         @param    input_ids (torch.Tensor): an input tensor with shape (batch_size,
@@ -143,52 +149,108 @@ class BertClassifier(nn.Module):
 
         # Extract the last hidden state of the token `[CLS]` for classification task
         last_hidden_state_cls = outputs[0][:, 0, :]
-
+        last_hidden_state_cls = torch.cat((last_hidden_state_cls,weight), dim=1)
         # Feed input to classifier to compute logits
         logits = self.classifier(last_hidden_state_cls)
+        probs_detail = F.softmax(logits, dim=1)
+        return probs_detail
 
-        return logits
 
-def train(model, train_dataloader, val_dataloader=None, optimizer=None, scheduler=None, epochs=4, evaluation=False,device=None,loss_fn=None):
+class cleanToken:
+    def __init__(self):
+        jiebaobj = i3_word_tokenizer.jieba_cut.jiebaTools(filter_syb=True)
+        jiebaobj.reset_jieba()
+        jiebaobj.jieba_setup()
+        self.jieba = jiebaobj
+
+    def cleanToken(self,text):
+        text = re.sub(r'(@.*?)[\s]', ' ', text)
+        # Replace '&amp;' with '&'
+        text = re.sub(r'&amp;', '&', text)
+        # Remove trailing whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        zh_sp = """[\s+\.\!\/_,$%^*(+\"\']+|[+——！，。？、~@#￥%……&*（）]+！，？｡＂＃＄％＆＇（）＊＋－／：；＜＝＞＠［＼］＾＿｀｛｜｝～｟｠｢｣､、〃》「」『』【】〔〕〖〗〘〙〚〛〜〝〞〟〰〾〿–—‘'‛“”„‟…‧﹏"""
+        en_sp = string.punctuation
+
+        wordlist = self.jieba.jieba_custom_lcut(text)
+        textbag = [word for word in wordlist if word!=' ' \
+                   and word not in zh_sp \
+                   and word not in en_sp]
+        return textbag
+
+def train(teacher, traindf, validdf, tokenizer, max_length=512, batch_size=64, optimizer=None, epochs=4, evaluation=False,device=None,loss_fn=None):
     """Train the BertClassifier model.
     """
     # Start training loop
     # Specify loss function
+    params = {'num_class':len(set(traindf['label'])),'colsample_bytree': 0.1974275059545383, 'drop_rate': 0.3100849740535157, 'learning_rate': 0.059536991142383075, 'max_bin': 899, 'max_depth': 10, 'min_child_samples': 2677, 'min_split_gain': 0.1, 'num_leaves': 40, 'reg_alpha': 0.1, 'reg_lambda': 142.02674856733813, 'sigmoid': 0.1, 'subsample': 1.0, 'subsample_for_bin': 1235, 'subsample_freq': 1, 'is_unbalance': True, 'random_state': 24, 'n_jobs': 10, 'objective': 'multiclass'}
     logger = logging.getLogger(__name__)
     if not device:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if not loss_fn:
         loss_fn = nn.CrossEntropyLoss()
+    logger.info('Tokenizing data...')
+    val_inputs, val_masks = preprocessing_for_bert(list(validdf['text']), tokenizer, max_length)
+    val_labels = torch.tensor(validdf['label']).to(device)
+    valsampleweight =  torch.ones([len(validdf), len(set(traindf['label']))], dtype=torch.float32).to(device)
+
+    # Create the DataLoader for our validation set
+    val_data = TensorDataset(val_inputs, val_masks, valsampleweight, val_labels)
+    val_sampler = SequentialSampler(val_data)
+    val_dataloader = DataLoader(val_data, sampler=val_sampler, batch_size=batch_size)
+
+    tokenobj = cleanToken()
+    custtokenizer = tokenobj.cleanToken
+    vect = CountVectorizer(tokenizer=custtokenizer)
+    train_vect = vect.fit_transform(traindf["text"])
+    train_vect_df = pd.DataFrame(train_vect.toarray())
+    logger.info('Student init model...')
+    train_dataset = lgb.Dataset(train_vect_df, label=traindf["label"], free_raw_data=False)
+    student = lgb.train(params, train_dataset, num_boost_round = 1)
+
+    valid_vect = vect.transform(validdf["text"])
+    valid_data = pd.DataFrame(valid_vect.toarray())
+    valid_dataset = lgb.Dataset(valid_data, label=validdf["label"], free_raw_data=False)
+    train_inputs, train_masks = preprocessing_for_bert(list(traindf['text']), tokenizer, max_length)
+
+    # Convert other data types to torch.Tensor
+    train_labels = torch.tensor(traindf['label']).to(device)
+
+    sampleweight =  torch.ones([len(traindf), len(set(traindf['label']))], dtype=torch.float32).to(device)
     logger.info("Start training...\n")
     for epoch_i in range(epochs):
         # =======================================
         #               Training
         # =======================================
         # Print the header of the result table
-        logger.info(f"{'Epoch':^7} | {'Batch':^7} | {'Train Loss':^12} | {'Val Loss':^10} | {'Val Acc':^9} | {'Elapsed':^9}")
-        logger.info("-"*70)
+        # Create the DataLoader for our training set
+        train_data = TensorDataset(train_inputs, train_masks, sampleweight, train_labels)
+        train_sampler = RandomSampler(train_data)
+        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=batch_size)
 
         # Measure the elapsed time of each epoch
         t0_epoch, t0_batch = time.time(), time.time()
 
         # Reset tracking variables at the beginning of each epoch
         total_loss, batch_loss, batch_counts = 0, 0, 0
-
+        train_pred = []
         # Put the model into the training mode
-        model.train()
+        teacher.train()
 
         # For each batch of training data...
         for step, batch in enumerate(train_dataloader):
             batch_counts +=1
             # Load batch to GPU
-            b_input_ids, b_attn_mask, b_labels = tuple(t.to(device) for t in batch)
+            b_input_ids, b_attn_mask, sample_weight, b_labels = tuple(t.to(device) for t in batch)
 
             # Zero out any previously calculated gradients
-            model.zero_grad()
+            teacher.zero_grad()
 
             # Perform a forward pass. This will return logits.
-            logits = model(b_input_ids, b_attn_mask)
-
+            logits = teacher(b_input_ids, b_attn_mask, sample_weight)
+            preds = torch.argmax(logits, dim=1).flatten()
+            train_pred += preds.tolist()
+            # train_weight = torch.tensor(train_pred).to(device)
             # Compute loss and accumulate the loss values
             loss = loss_fn(logits, b_labels)
             batch_loss += loss.item()
@@ -198,48 +260,49 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
             loss.backward()
 
             # Clip the norm of the gradients to 1.0 to prevent "exploding gradients"
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(teacher.parameters(), 1.0)
 
             # Update parameters and the learning rate
             optimizer.step()
-            scheduler.step()
-
-            # Print the loss values and time elapsed for every 20 batches
-            if (step % 20 == 0 and step != 0) or (step == len(train_dataloader) - 1):
-                # Calculate time elapsed for 20 batches
-                time_elapsed = time.time() - t0_batch
-
-                # Print training results
-                logger.info(f"{epoch_i + 1:^7} | {step:^7} | {batch_loss / batch_counts:^12.6f} | {'-':^10} | {'-':^9} | {time_elapsed:^9.2f}")
-
-                # Reset batch tracking variables
-                batch_loss, batch_counts = 0, 0
-                t0_batch = time.time()
 
         # Calculate the average loss over the entire training data
-        avg_train_loss = total_loss / len(train_dataloader)
+        avg_teacher_train_loss = total_loss / len(train_dataloader)
+        traindf['teacher_pred_label'] = [1 if i>0.5 else 0 for i in train_pred]
+        teacher_tr_acc = sklearn.metrics.accuracy_score(traindf['label'], traindf['teacher_pred_label'])
+        logger.info("valid teacher...")
+        teacher_val_loss, teacher_val_acc = evaluate(teacher, val_dataloader,
+                                                     device=device)
 
-        logger.info("-"*70)
-        # =======================================
-        #               Evaluation
-        # =======================================
-        if evaluation == True:
-            # After the completion of each training epoch, measure the model's performance
-            # on our validation set.
-            val_loss, val_accuracy, report, confusion = evaluate(model, val_dataloader,device=device,loss_fn=loss_fn)
+        #train_vect_df = pd.DataFrame(train_vect.toarray())
+        train_data_weight = traindf.apply(lambda x:10 if x['teacher_pred_label']!=x['label'] else 1, axis=1)
 
-            # Print performance over the entire training data
-            time_elapsed = time.time() - t0_epoch
+        params["weight_column"] = "name:weight"
+        train_dataset = lgb.Dataset(train_vect_df, weight=train_data_weight,label=traindf["label"], free_raw_data=False)
+        student = lgb.train(params, train_dataset, num_boost_round = 50,
+                            init_model = student, valid_sets=valid_dataset,
+                            early_stopping_rounds=10,keep_training_booster=True,
+                            verbose_eval=False)
 
-            logger.info(f"{epoch_i + 1:^7} | {'-':^7} | {avg_train_loss:^12.6f} | {val_loss:^10.6f} | {val_accuracy:^9.2f} | {time_elapsed:^9.2f}")
-            logger.info("-"*70)
+        tr_stu_pred_proba = student.predict(train_vect_df)
+
+        traindf["stu_pred"] = np.argmax(tr_stu_pred_proba,axis=1)
+        student_tr_acc = sklearn.metrics.accuracy_score(traindf['label'], traindf["stu_pred"])
+
+        stu_pred = student.predict(valid_data)
+        validdf["stu_pred"] = np.argmax(stu_pred,axis=1)
+        student_val_acc = sklearn.metrics.accuracy_score(validdf['label'], validdf["stu_pred"])
+        sampleweight = torch.tensor(tr_stu_pred_proba,dtype=torch.float32).to(device)
+        logger.info(f"{'Epoch':^7} | {'teacher_val_loss':^7} | {'teacher_tr_acc':^12} | {'teacher_val_acc':^10} | {'student_tr_acc':^9} | {'student_val_acc':^9}")
+        logger.info(f"{epoch_i + 1:^7} | {teacher_val_loss:^9.2f}| {teacher_tr_acc:^9.2f} | {teacher_val_acc:^9.2f} | {student_tr_acc:^9.2f}| {student_val_acc:^9.2f}")
+
+    report = sklearn.metrics.classification_report(validdf["label"] , validdf["stu_pred"] , digits=4)
+    confusion = sklearn.metrics.confusion_matrix(validdf["label"] , validdf["stu_pred"])
     logger.info("Precision, Recall and F1-Score...")
     logger.info(str(report))
     logger.info("Confusion Matrix...")
     logger.info(str(confusion))
     logger.info("\n")
     logger.info("Training complete!")
-    return model
 
 
 def evaluate(model, val_dataloader,device=None,loss_fn=None):
@@ -262,11 +325,11 @@ def evaluate(model, val_dataloader,device=None,loss_fn=None):
     # For each batch in our validation set...
     for batch in val_dataloader:
         # Load batch to GPU
-        b_input_ids, b_attn_mask, b_labels = tuple(t.to(device) for t in batch)
+        b_input_ids, b_attn_mask, sample_weight, b_labels = tuple(t.to(device) for t in batch)
 
         # Compute logits
         with torch.no_grad():
-            logits = model(b_input_ids, b_attn_mask)
+            logits = model(b_input_ids, b_attn_mask, sample_weight)
 
         # Compute loss
         loss = loss_fn(logits, b_labels)
@@ -283,11 +346,11 @@ def evaluate(model, val_dataloader,device=None,loss_fn=None):
 
     # Compute the average accuracy and loss over the validation set.
     val_loss = np.mean(val_loss)
-    val_accuracy = (torch.tensor(predict_all) == torch.tensor(labels_all)).cpu().numpy().mean() * 100
-    target_names = [str(i) for i in sorted(list(set(labels_all)))]
-    report = metrics.classification_report(labels_all, predict_all, target_names=target_names, digits=4)
-    confusion = metrics.confusion_matrix(labels_all, predict_all)
-    return val_loss, val_accuracy, report, confusion
+    val_accuracy = (torch.tensor(predict_all) == torch.tensor(labels_all)).cpu().numpy().mean()
+    #target_names = [str(i) for i in sorted(list(set(labels_all)))]
+    #report = sklearn.metrics.classification_report(labels_all, predict_all, target_names=target_names, digits=4)
+    #confusion = sklearn.metrics.confusion_matrix(labels_all, predict_all)
+    return val_loss, val_accuracy
 
 def compute_metrics(pred):
     labels = pred.label_ids
@@ -337,57 +400,25 @@ def main():
     # load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(bert_pretrain)
 
-    # Run function `preprocessing_for_bert` on the train set and the validation set
-    logger.info('Tokenizing data...')
-    train_inputs, train_masks = preprocessing_for_bert(list(traindf['text']), tokenizer, max_length)
-    val_inputs, val_masks = preprocessing_for_bert(list(validdf['text']), tokenizer, max_length)
-
-    # Convert other data types to torch.Tensor
-    train_labels = torch.tensor(traindf['label'], device='cpu')
-    val_labels = torch.tensor(validdf['label'], device='cpu')
-
-    # Create the DataLoader for our training set
-    train_data = TensorDataset(train_inputs, train_masks, train_labels)
-    train_sampler = RandomSampler(train_data)
-    train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=batch_size)
-
-    # Create the DataLoader for our validation set
-    val_data = TensorDataset(val_inputs, val_masks, val_labels)
-    val_sampler = SequentialSampler(val_data)
-    val_dataloader = DataLoader(val_data, sampler=val_sampler, batch_size=batch_size)
-
     # load the model and pass to CUDA
-    model = BertClassifier(model_path=bert_pretrain,
-                           D_in=768, H=50,
-                           D_out=len(set(traindf['label'])),
-                           freeze_bert=False).to(device)
+    temodel = BertClassifier(model_path=bert_pretrain,
+                             D_in=768+len(set(traindf['label'])), H=50,
+                             D_out=len(set(traindf['label'])),
+                             freeze_bert=False).to(device)
 
 
     # Create the optimizer
-    optimizer = AdamW(model.parameters(),
+    optimizer = AdamW(temodel.parameters(),
                       lr=5e-5,    # Default learning rate
                       eps=1e-8    # Default epsilon value
                       )
 
-    # Total number of training steps
-    total_steps = len(train_dataloader) * epochs
 
-    # Set up the learning rate scheduler
-    scheduler = get_linear_schedule_with_warmup(optimizer,
-                                                num_warmup_steps=0, # Default value
-                                                num_training_steps=total_steps)
-
-    model = train(model=model, train_dataloader=train_dataloader,
-          val_dataloader=val_dataloader,
-          optimizer=optimizer, scheduler=scheduler,
+    train(teacher=temodel, traindf=traindf,
+          validdf=validdf, tokenizer=tokenizer, batch_size=batch_size,
+          optimizer=optimizer,
           epochs=epochs, evaluation=True,device=device)
-    #model.save_pretrained('./%s/model' % runname)
-    model.to(torch.device("cpu"))
-    tokenizer.save_pretrained('./%s/model' % runname)
-    torch.save(model,'./%s/model/model.pt' % runname)
-    with open('./%s/model/model.pkl' % runname,'wb') as mf:
-        pickle.dump(model,mf)
-    torch.save(model.state_dict(), './%s/model/weight.ckpt' % runname)
+
 
 if __name__ == "__main__":
     main()

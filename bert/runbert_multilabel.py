@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 from transformers import BertModel
+import torch.nn.functional as F
 import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from transformers.file_utils import is_tf_available, is_torch_available, is_torch_tpu_available
@@ -11,17 +12,14 @@ import numpy as np
 import random
 import sklearn.metrics
 from sklearn.model_selection import train_test_split
-from sklearn import metrics
 import re
 import time
 import pickle
 import argparse
-import logging
-import logging.config
-import os
-import sys
 import shutil
-
+import os
+import logging
+import sys
 ##########################################
 ## Options and defaults
 ##########################################
@@ -99,11 +97,10 @@ def preprocessing_for_bert(textdata, tokenizer, pad):
 
     return input_ids, attention_masks
 
-
 class BertClassifier(nn.Module):
     """Bert Model for Classification Tasks.
     """
-    def __init__(self, model_path, D_in=768, H=50, D_out=2, freeze_bert=False):
+    def __init__(self, model_path, n_classes=2, freeze_bert=False):
         """
         @param    bert: a BertModel object
         @param    classifier: a torch.nn.Module classifier
@@ -115,12 +112,7 @@ class BertClassifier(nn.Module):
         self.bert = BertModel.from_pretrained(model_path)
 
         # Instantiate an one-layer feed-forward classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(D_in, H),
-            nn.ReLU(),
-            #nn.Dropout(0.5),
-            nn.Linear(H, D_out)
-        )
+        self.classifier=nn.Linear(self.bert.config.hidden_size,n_classes)
 
         # Freeze the BERT model
         if freeze_bert:
@@ -141,15 +133,12 @@ class BertClassifier(nn.Module):
         outputs = self.bert(input_ids=input_ids,
                             attention_mask=attention_mask)
 
-        # Extract the last hidden state of the token `[CLS]` for classification task
-        last_hidden_state_cls = outputs[0][:, 0, :]
-
         # Feed input to classifier to compute logits
-        logits = self.classifier(last_hidden_state_cls)
+        logits = self.classifier(outputs.pooler_output)
 
         return logits
 
-def train(model, train_dataloader, val_dataloader=None, optimizer=None, scheduler=None, epochs=4, evaluation=False,device=None,loss_fn=None):
+def train(model, train_dataloader, val_dataloader=None, optimizer=None, scheduler=None, epochs=4, evaluation=False,device=None,loss_fn=None, class_name=[]):
     """Train the BertClassifier model.
     """
     # Start training loop
@@ -188,9 +177,9 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
 
             # Perform a forward pass. This will return logits.
             logits = model(b_input_ids, b_attn_mask)
-
+            output_sig = torch.sigmoid(logits)
             # Compute loss and accumulate the loss values
-            loss = loss_fn(logits, b_labels)
+            loss = loss_fn(output_sig, b_labels)
             batch_loss += loss.item()
             total_loss += loss.item()
 
@@ -226,23 +215,20 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
         if evaluation == True:
             # After the completion of each training epoch, measure the model's performance
             # on our validation set.
-            val_loss, val_accuracy, report, confusion = evaluate(model, val_dataloader,device=device,loss_fn=loss_fn)
+            val_loss, val_accuracy,report = evaluate(model, val_dataloader,device=device,loss_fn=loss_fn,class_name=class_name)
 
             # Print performance over the entire training data
             time_elapsed = time.time() - t0_epoch
 
             logger.info(f"{epoch_i + 1:^7} | {'-':^7} | {avg_train_loss:^12.6f} | {val_loss:^10.6f} | {val_accuracy:^9.2f} | {time_elapsed:^9.2f}")
             logger.info("-"*70)
+        logger.info("\n")
     logger.info("Precision, Recall and F1-Score...")
     logger.info(str(report))
-    logger.info("Confusion Matrix...")
-    logger.info(str(confusion))
-    logger.info("\n")
     logger.info("Training complete!")
     return model
 
-
-def evaluate(model, val_dataloader,device=None,loss_fn=None):
+def evaluate(model, val_dataloader,device=None,loss_fn=None,class_name=[]):
     """After the completion of each training epoch, measure the model's performance
     on our validation set.
     """
@@ -255,10 +241,10 @@ def evaluate(model, val_dataloader,device=None,loss_fn=None):
     model.eval()
 
     # Tracking variables
-    val_accuracy = 0
+    val_accuracy = []
     val_loss = []
-    predict_all = []
     labels_all = []
+    predict_all = []
     # For each batch in our validation set...
     for batch in val_dataloader:
         # Load batch to GPU
@@ -267,27 +253,29 @@ def evaluate(model, val_dataloader,device=None,loss_fn=None):
         # Compute logits
         with torch.no_grad():
             logits = model(b_input_ids, b_attn_mask)
-
+        output_sig = torch.sigmoid(logits)
         # Compute loss
-        loss = loss_fn(logits, b_labels)
+        loss = loss_fn(output_sig, b_labels)
         val_loss.append(loss.item())
 
         # Get the predictions
-        preds = torch.argmax(logits, dim=1).flatten()
-        predict_all = predict_all+preds.tolist()
-        labels_all = labels_all+b_labels.tolist()
+        logits[logits >= 0.5] = 1
+        logits[logits < 0.5] = 0
 
         # Calculate the accuracy rate
-        #accuracy = (preds == b_labels).cpu().numpy().mean() * 100
-        #val_accuracy.append(accuracy)
+        accuracy = (logits == b_labels).sum().cpu() / (logits.size()[0]*logits.size()[1]) * 100
+        val_accuracy.append(accuracy)
+        predict_all = predict_all+logits.tolist()
+        labels_all = labels_all+b_labels.tolist()
 
     # Compute the average accuracy and loss over the validation set.
     val_loss = np.mean(val_loss)
-    val_accuracy = (torch.tensor(predict_all) == torch.tensor(labels_all)).cpu().numpy().mean() * 100
-    target_names = [str(i) for i in sorted(list(set(labels_all)))]
-    report = metrics.classification_report(labels_all, predict_all, target_names=target_names, digits=4)
-    confusion = metrics.confusion_matrix(labels_all, predict_all)
-    return val_loss, val_accuracy, report, confusion
+    val_accuracy = np.mean(val_accuracy)
+    target_names = [str(i) for i in labels_all[0]]
+    if class_name:
+        target_names = [class_name[i] for i in range(len(target_names))]
+    report = sklearn.metrics.classification_report(labels_all, predict_all, target_names=target_names, digits=4)
+    return val_loss, val_accuracy,report
 
 def compute_metrics(pred):
     labels = pred.label_ids
@@ -301,6 +289,9 @@ def compute_metrics(pred):
 def main():
     options = getOptions()
     print(options)
+    seed = 2021
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     runname = options.run
     if  os.path.exists(runname):
         shutil.rmtree(runname)
@@ -311,14 +302,19 @@ def main():
     stdout_handler = logging.StreamHandler(sys.stdout)
     logger.addHandler(output_file_handler)
     logger.addHandler(stdout_handler)
-
-    seed = 2021
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
+    optionsdict = vars(options)
+    cmdstr = ''
+    for ops in optionsdict:
+        cmdstr += "--%s=%s " % (ops, str(optionsdict[ops]))
+    logger.info(cmdstr+'\n')
+    if options.class_list:
+        class_list = options.class_list.split(',')
+    else:
+        class_list = []
     #bert_pretrain = "/work/pretrain/huggingface/roberta-base-finetuned-chinanews-chinese/"
     if not options.pretrain:
         raise
+
     bert_pretrain = options.pretrain
     max_length = options.pad_size
     batch_size = options.batch_size
@@ -343,8 +339,8 @@ def main():
     val_inputs, val_masks = preprocessing_for_bert(list(validdf['text']), tokenizer, max_length)
 
     # Convert other data types to torch.Tensor
-    train_labels = torch.tensor(traindf['label'], device='cpu')
-    val_labels = torch.tensor(validdf['label'], device='cpu')
+    train_labels = torch.FloatTensor(traindf['label'].apply(lambda x:eval(x)))
+    val_labels = torch.FloatTensor(validdf['label'].apply(lambda x:eval(x)))
 
     # Create the DataLoader for our training set
     train_data = TensorDataset(train_inputs, train_masks, train_labels)
@@ -355,11 +351,10 @@ def main():
     val_data = TensorDataset(val_inputs, val_masks, val_labels)
     val_sampler = SequentialSampler(val_data)
     val_dataloader = DataLoader(val_data, sampler=val_sampler, batch_size=batch_size)
-
+    n_classes = len(list(train_labels)[0])
     # load the model and pass to CUDA
     model = BertClassifier(model_path=bert_pretrain,
-                           D_in=768, H=50,
-                           D_out=len(set(traindf['label'])),
+                           n_classes=n_classes,
                            freeze_bert=False).to(device)
 
 
@@ -377,10 +372,13 @@ def main():
                                                 num_warmup_steps=0, # Default value
                                                 num_training_steps=total_steps)
 
+    criterion = nn.BCELoss(weight=None, size_average=True)
+
     model = train(model=model, train_dataloader=train_dataloader,
           val_dataloader=val_dataloader,
           optimizer=optimizer, scheduler=scheduler,
-          epochs=epochs, evaluation=True,device=device)
+          epochs=3, evaluation=True,device=device,loss_fn=criterion,
+          class_name=class_list)
     #model.save_pretrained('./%s/model' % runname)
     model.to(torch.device("cpu"))
     tokenizer.save_pretrained('./%s/model' % runname)
