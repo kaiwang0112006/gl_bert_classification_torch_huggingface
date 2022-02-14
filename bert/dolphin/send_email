@@ -1,0 +1,43 @@
+import smtplib
+
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+from email.header import Header
+import sys
+import pandas as pd
+# define
+fromMail = "geely.i3@geely.com"
+username = "geely.i3@geely.com"
+toMail = ["Kai.Wang23@geely.com"]
+#toMail = ["Kai.Wang23@geely.com","Bin.Guo21@geely.com"]
+smtpHost = "outlook.geely.com"
+smtpPort = 587
+password = "wiYnZ[rb"
+
+output = "/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/model_batch_pred_${dt}.csv"
+filename = "model_batch_pred_${dt}.csv"
+df = pd.read_csv(output,encoding='utf_8_sig')
+#邮件标题和内容
+subject  = '属性级情感模型预测结果-${dt}'
+body     = '抽取${dt}的%s样本' % str(len(df))
+#初始化邮件
+encoding = 'utf-8'
+mail = MIMEMultipart()
+mail.attach(MIMEText(body,'plain','utf-8'))
+mail['Subject'] = Header(subject,'utf-8')
+mail['From'] = Header(fromMail,'utf-8')
+mail['To'] = Header(",".join(toMail),'utf-8')
+mail['Date'] = '${dt}'
+attach = MIMEApplication(open(output,'rb').read())
+attach.add_header('Content-Disposition', 'attachment',filename=filename)
+mail.attach(attach)
+# tls加密方式，通信过程加密，邮件数据安全，使用正常的smtp端口
+smtp = smtplib.SMTP(smtpHost,smtpPort)
+smtp.set_debuglevel(True)
+smtp.ehlo()
+smtp.starttls()
+smtp.ehlo()
+smtp.login(username,password)
+smtp.sendmail(fromMail,toMail,mail.as_string())
+smtp.close()

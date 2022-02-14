@@ -1,0 +1,16 @@
+from sqlalchemy import create_engine
+from urllib import parse
+import pandas as pd
+
+db_info = {
+  "host":"10.240.16.33",
+  "port":3306,
+  "user":"sentiment",
+  "password":parse.quote_plus("ysu839@Am%8sq"),
+  "database":"i3"
+}
+
+output = "/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/model_batch_pred_${dt}.csv"
+resultdf = pd.read_csv(output,encoding="utf_8_sig")
+engine = create_engine('mysql+pymysql://%(user)s:%(password)s@%(host)s:%(port)s/%(database)s?charset=utf8' % db_info,encoding='utf-8')
+resultdf.to_sql('emotion_batchrun', engine, index=False, if_exists='replace')

@@ -8,6 +8,7 @@ import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from transformers.file_utils import is_tf_available, is_torch_available, is_torch_tpu_available
 from transformers import *
+from torch_ort import ORTModule
 import numpy as np
 import random
 import sklearn.metrics
@@ -141,7 +142,7 @@ class BertClassifier(nn.Module):
         # Feed input to classifier to compute logits
         out1 = self.fc1(outputs.pooler_output)
         out2 = self.fc2(outputs.pooler_output)
-        return F.softmax(out1), F.softmax(out2)
+        return F.softmax(out1,dim=1), F.softmax(out2,dim=1)
 
 def train(model, train_dataloader, val_dataloader=None, optimizer=None, scheduler=None, epochs=4, evaluation=False,device=None,loss_fn=None, class_name=[]):
     """Train the BertClassifier model.
@@ -367,6 +368,7 @@ def main():
                            n_classes=n_classes,
                            freeze_bert=False).to(device)
     print(model)
+    model = ORTModule(model)
     # Create the optimizer
     optimizer = AdamW(model.parameters(),
                       lr=5e-5,    # Default learning rate
