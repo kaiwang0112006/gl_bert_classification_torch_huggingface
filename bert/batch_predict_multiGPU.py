@@ -19,7 +19,7 @@ import rule_engine
 sys.path.append("/work/kw/ppackage")
 from miloTools.tools.multi_apply import *
 from urllib import parse
-
+import random
 
 ##########################################
 ## Options and defaults
@@ -231,8 +231,11 @@ def get_mix(model, tokenizer, text, device, max_length=128):
     except:
         return (-1, -1)
 
-def get_property(model, tokenizer, text, device, max_length=128, ltype=1):
+def get_property(text, model, tokenizer, max_length=128, ltype=1):
+    gpuid = random.randint(0, 1)
+    device = torch.device('cuda:%s' % str(gpuid))
     try:
+        model = model.to(device)
         encoded_sent = tokenizer.encode_plus(
             text=text_preprocessing(text),  # Preprocess sentence
             add_special_tokens=True,  # Add `[CLS]` and `[SEP]`
@@ -294,7 +297,7 @@ def get_label(r, label=1):
                 79: '行驶稳定性', 80: '试乘试驾', 81: '质量投诉', 82: '购车价格', 83: '购车费用', 84: '起步动力性能', 85: '车内互联系统', 86: '车内储物空间',
                 87: '车内气味', 88: '车内静音效果', 89: '车头', 90: '车尾', 91: '车标', 92: '车系评价', 93: '车联网', 94: '车身结构安全', 95: '车轮',
                 96: '转向性能', 97: '配置丰富性', 98: '配置实用性', 99: '销售专业性', 100: '销售政策', 101: '销售服务态度', 102: '销售诚信', 103: '销量',
-                104: '门店布局', 105: '门店环境', 106: '门店设施', 107: '驾驶操作舒适性', 108: '驾驶视觉安全'}
+                104: '门店布局', 105: '门店环境', 106: '门店设施', 107: '驾驶操作舒适性', 108: '驾驶视觉安全',109: 'general'}
     else:
         lmap = {0: '负面', 1: '中性', 2: '正面'}
 
@@ -368,27 +371,27 @@ def main():
     #datadf = datadf[datadf["hits"]!=()].reset_index().drop(["index"],axis=1)
     #datadf["hits"] = datadf["hits"].apply(lambda x:", ".join(x))
     logger.info("hit data done， samples: %s" % str(len(datadf)))
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     model1 = BertClassifier2(model_path="/work/pretrain/huggingface/ernie_pretrain",
                            D_in=768, H=50,
                            D_out=110,
-                           freeze_bert=False).to(device)
+                           freeze_bert=False)
     model1.load_state_dict(
-        torch.load("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/property_ernie/model/weight.ckpt",
-                   map_location=device))
+        torch.load("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/property_ernie/model/weight.ckpt"))
     tokenizer1 = AutoTokenizer.from_pretrained("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/property_ernie/model")
 
     model2 = BertClassifier2(model_path="/work/pretrain/huggingface/ernie_pretrain",
                            D_in=768, H=50,
                            D_out=3,
-                           freeze_bert=False).to(device)
+                           freeze_bert=False)
     model2.load_state_dict(
-        torch.load("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/emotion_ernie/model/weight.ckpt",
-                   map_location=device))
+        torch.load("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/emotion_ernie/model/weight.ckpt"))
     tokenizer2 = AutoTokenizer.from_pretrained("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/emotion_ernie/model")
 
-    datadf["property"] = datadf["text"].apply(lambda t: get_property(model1, tokenizer1, t, device))
-    datadf["emotion"] = datadf["text"].apply(lambda t: get_property(model2, tokenizer2, t, device,128,0))
+    datadf = apply_by_multiprocessing(datadf, get_property, key='text', target='property', model=model1, tokenizer=tokenizer1, max_length=128, ltype=1, workers=4)
+    datadf = apply_by_multiprocessing(datadf, get_property, key='text', target='emotion', model=model2, tokenizer=tokenizer2, max_length=128, ltype=0, workers=4)
+    #datadf["property"] = datadf["text"].apply(lambda t: get_property(model1, tokenizer1, t))
+    #datadf["emotion"] = datadf["text"].apply(lambda t: get_property(model2, tokenizer2, t,128,0))
     logger.info("predict done, -1 count: %s" % len(datadf[(datadf["emotion"] == '') | (datadf["property"] == '')]))
     datadf = datadf[(datadf["emotion"]!='') & (datadf["property"]!='') ]
     datadf["comb"] = datadf.apply(lambda r: (r["property"], r["emotion"]), axis=1)

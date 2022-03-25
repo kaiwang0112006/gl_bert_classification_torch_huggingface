@@ -15,7 +15,7 @@ import datetime
 import logging
 import re
 from sqlalchemy import create_engine
-import rule_engine
+
 sys.path.append("/work/kw/ppackage")
 from miloTools.tools.multi_apply import *
 from urllib import parse
@@ -231,7 +231,7 @@ def get_mix(model, tokenizer, text, device, max_length=128):
     except:
         return (-1, -1)
 
-def get_property(model, tokenizer, text, device, max_length=128, ltype=1):
+def get_property(model, tokenizer, text, device, max_length=128):
     try:
         encoded_sent = tokenizer.encode_plus(
             text=text_preprocessing(text),  # Preprocess sentence
@@ -248,34 +248,9 @@ def get_property(model, tokenizer, text, device, max_length=128, ltype=1):
         with torch.no_grad():
             probs_detail = model(input_ids, attention_masks)
         prob = probs_detail[0].tolist()
-        return get_label(prob,label=ltype)
+        return get_label(prob)
     except:
         return ""
-
-def gethits(x,ruledict):
-    hitlist = []
-    for r in ruledict:
-        rv = rule_engine.Rule(ruledict[r])
-        if rv.matches({"text":x}):
-            hitlist.append(r)
-    return ", ".join(hitlist)
-
-def getrule(r):
-    rlist = []
-
-    for k in range(1, 11):
-        rstring = ""
-        colname = "Keyword%s" % str(k)
-        if len(r[colname]) > 0:
-            if "+" in r[colname]:
-                for w in r[colname].split("+"):
-                    w = '"%s"' % w
-                    rstring += w + " in text and "
-            else:
-                w = '"%s"' % r[colname]
-                rstring += w + " in text and "
-            rlist.append("(" + rstring[:-4] + ")")
-    return " or ".join(rlist)
 
 
 def get_label(r, label=1):
@@ -297,7 +272,6 @@ def get_label(r, label=1):
                 104: '门店布局', 105: '门店环境', 106: '门店设施', 107: '驾驶操作舒适性', 108: '驾驶视觉安全'}
     else:
         lmap = {0: '负面', 1: '中性', 2: '正面'}
-
     k = np.argmax(r)
     return lmap[k]
 
@@ -345,7 +319,7 @@ def main():
         on nt.news_uuid = cls.news_uuid
     ''' % (d_before_1, d_before_1, d_before_1)
 
-    daydf = get_hivedf(daysql)
+    daydf = get_hivedf(daysql).head(100)
     logger.info("hive sql done， samples: %s" % str(len(daydf)))
     daydf["text"] = daydf["news_content"].apply(lambda x: cut_sentences(x))
     daydf["len"] = daydf["text"].apply(lambda x: len(x))
@@ -359,51 +333,44 @@ def main():
     datadf["len"] = datadf["text"].apply(lambda x: len(x))
     datadf = datadf[datadf['len'] > 5]
     logger.info("sum data done， samples: %s" % str(len(datadf)))
-    kwdf = pd.read_excel("/work/kw/yuqing/data/phase2/2022年舆情监测项目 - 分析体系语料_20220216(关键词）.xlsx").fillna("")
-    kwdf["rule"] = kwdf.apply(lambda r:getrule(r),axis=1)
-    kwdf = kwdf[kwdf["rule"]!=""]
-    ruledict = dict(zip(kwdf["class3_name"],kwdf["rule"]))
-    datadf = apply_by_multiprocessing(datadf, gethits, key='text', target='hits', ruledict=ruledict, workers=10)
-    #datadf["hits"] = datadf["text"].apply(lambda x:gethits(x,ruledict))
-    #datadf = datadf[datadf["hits"]!=()].reset_index().drop(["index"],axis=1)
-    #datadf["hits"] = datadf["hits"].apply(lambda x:", ".join(x))
-    logger.info("hit data done， samples: %s" % str(len(datadf)))
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model1 = BertClassifier2(model_path="/work/pretrain/huggingface/ernie_pretrain",
-                           D_in=768, H=50,
-                           D_out=110,
+    model1 = BertClassifier1(model_path="/work/pretrain/huggingface/ernie_pretrain",
+                           n_classes=[109, 3],
                            freeze_bert=False).to(device)
     model1.load_state_dict(
-        torch.load("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/property_ernie/model/weight.ckpt",
+        torch.load("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/mix/model/weight.ckpt",
                    map_location=device))
-    tokenizer1 = AutoTokenizer.from_pretrained("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/property_ernie/model")
+    tokenizer1 = AutoTokenizer.from_pretrained("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/mix/model")
 
     model2 = BertClassifier2(model_path="/work/pretrain/huggingface/ernie_pretrain",
                            D_in=768, H=50,
-                           D_out=3,
+                           D_out=109,
                            freeze_bert=False).to(device)
     model2.load_state_dict(
-        torch.load("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/emotion_ernie/model/weight.ckpt",
+        torch.load("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/property/model/weight.ckpt",
                    map_location=device))
-    tokenizer2 = AutoTokenizer.from_pretrained("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/emotion_ernie/model")
+    tokenizer2 = AutoTokenizer.from_pretrained("/work/kw/yuqing/gl_bert_classification_torch_huggingface/bert/property/model")
 
-    datadf["property"] = datadf["text"].apply(lambda t: get_property(model1, tokenizer1, t, device))
-    datadf["emotion"] = datadf["text"].apply(lambda t: get_property(model2, tokenizer2, t, device,128,0))
-    logger.info("predict done, -1 count: %s" % len(datadf[(datadf["emotion"] == '') | (datadf["property"] == '')]))
-    datadf = datadf[(datadf["emotion"]!='') & (datadf["property"]!='') ]
+    datadf["pred_mix"] = datadf["text"].apply(lambda t: get_mix(model1, tokenizer1, t, device))
+    datadf["property"] = datadf["text"].apply(lambda t: get_property(model2, tokenizer2, t, device))
+    print(datadf[datadf["pred_mix"] == (-1, -1)].head())
+    logger.info("predict done, -1 count: %s" % len(datadf[datadf["pred_mix"] == (-1, -1)]))
+
+    datadf = datadf[datadf["pred_mix"] != (-1, -1)].drop_duplicates(subset=["text"],keep="first")
+    #datadf["property"] = datadf["pred_mix"].apply(lambda x: get_label(x[0], 1))
+    datadf["emotion"] = datadf["pred_mix"].apply(lambda x: get_label(x[1], 2))
     datadf["comb"] = datadf.apply(lambda r: (r["property"], r["emotion"]), axis=1)
-    #combset = set(datadf["comb"])
-    #sn = int(30000 / len(combset))
-    #dlist = []
-    #for comb in combset:
-    #    subdf = datadf[datadf['comb'] == comb]
-    #    if len(subdf) > sn:
-    #        subdf = subdf.sample(n=sn, random_state=24)
-    #    dlist.append(subdf)
-    #resultdf = pd.concat(dlist)
-    resultdf = datadf.copy()
-    resultdf = resultdf.drop(["comb","len"], axis=1)
-    resultdf["datatime"] = d_before_1
+    combset = set(datadf["comb"])
+    sn = int(30000 / len(combset))
+    dlist = []
+    for comb in combset:
+        subdf = datadf[datadf['comb'] == comb]
+        if len(subdf) > sn:
+            subdf = subdf.sample(n=sn, random_state=24)
+        dlist.append(subdf)
+    resultdf = pd.concat(dlist)
+    resultdf = resultdf.drop(["comb", "pred_mix"], axis=1)
+    resultdf["date"] = d_before_1
     logger.info("resultdf done， samples: %s" % str(len(resultdf)))
 
     resultdf.to_csv("model_batch_pred_%s.csv" % d_before_1, index=False, encoding='utf_8_sig')

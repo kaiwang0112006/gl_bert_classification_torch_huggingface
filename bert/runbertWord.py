@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import BertModel
 import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
@@ -11,6 +12,7 @@ import numpy as np
 import random
 import sklearn.metrics
 from sklearn.model_selection import train_test_split
+from sklearn import metrics
 import re
 import time
 import pickle
@@ -20,7 +22,23 @@ import logging.config
 import os
 import sys
 import shutil
-import pandas as pd
+import i3_word_tokenizer
+
+class cleanTokenv1_0_2:
+    def __init__(self):
+        jiebaobj = i3_word_tokenizer.jieba_cut.jiebaTools(filter_syb=False,env='dev')
+        jiebaobj.reset_jieba()
+        jiebaobj.jieba_setup()
+        self.jieba = jiebaobj
+
+    def cleanToken(self,text):
+        #text = re.sub(r'(@.*?)[\s]', ' ', text)
+        # Replace '&amp;' with '&'
+        text = text_preprocessing(text)
+
+        wordlist = self.jieba.jieba_custom_lcut(text)
+        return wordlist
+
 
 ##########################################
 ## Options and defaults
@@ -56,7 +74,7 @@ def text_preprocessing(text):
     return text
 
 # Create a function to tokenize a set of texts
-def preprocessing_for_bert(textdata, tokenizer, pad):
+def preprocessing_for_bert(textdata, tokenizer, pad,cutword=None):
     """Perform required preprocessing steps for pretrained BERT.
     @param    data (np.array): Array of texts to be processed.
     @return   input_ids (torch.Tensor): Tensor of token ids to be fed to a model.
@@ -68,6 +86,11 @@ def preprocessing_for_bert(textdata, tokenizer, pad):
     attention_masks = []
     # For every sentence...
     for sent in textdata:
+        if cutword:
+            sent = tuple(cutword(sent))
+            is_split_into_words = True
+        else:
+            is_split_into_words = False
         # `encode_plus` will:
         #    (1) Tokenize the sentence
         #    (2) Add the `[CLS]` and `[SEP]` token to the start and end
@@ -76,13 +99,14 @@ def preprocessing_for_bert(textdata, tokenizer, pad):
         #    (5) Create attention mask
         #    (6) Return a dictionary of outputs
         encoded_sent = tokenizer.encode_plus(
-            text=text_preprocessing(sent),  # Preprocess sentence
+            text=sent,  # Preprocess sentence
             add_special_tokens=True,        # Add `[CLS]` and `[SEP]`
             max_length=pad,                  # Max length to truncate/pad
             padding='max_length',         # Pad sentence to max length
             truncation=True,
             return_tensors='pt',           # Return PyTorch tensor
-            return_attention_mask=True      # Return attention mask
+            return_attention_mask=True,      # Return attention mask
+            is_split_into_words=is_split_into_words
         )
 
         # Add the outputs to the lists
@@ -99,69 +123,6 @@ def preprocessing_for_bert(textdata, tokenizer, pad):
 
     return input_ids, attention_masks
 
-
-##############################################################################
-# dataset
-##############################################################################
-def load_dataset(filepath, pad_size, tokenizer):
-    contents = []
-    with open(filepath, 'r') as f:
-        linecount = 0
-        for line in f:
-            lin = line.strip()
-            if not lin or  linecount==0:
-                linecount+=1
-                continue
-            label, content = lin.split('\t')
-            input_ids, attention_masks = preprocessing_for_bert(content, tokenizer, pad_size)
-
-            contents.append((input_ids, attention_masks, label)) # len(words_line) is not used
-    return contents
-
-def build_iterator(dataset,datalen, tokenizer, pad_size, batch_size, device):
-    iters = DatasetIterater(dataset, datalen, tokenizer, pad_size, batch_size, device)
-    return iters
-
-
-class DatasetIterater(object):
-    def __init__(self, dataset, datalen, tokenizer, pad_size, batch_size, device):
-        self.batch_size = batch_size
-        self.batches = pd.read_csv(dataset,sep='\t', iterator=True)
-        self.n_batches = datalen // batch_size
-        self.residue = False  # 记录batch数量是否为整数
-        if datalen % self.n_batches != 0:
-            self.residue = True
-        self.index = 0
-        self.device = device
-        self.tokenizer = tokenizer
-        self.pad_size = pad_size
-
-    def _to_tensor(self, texts, label):
-
-        input_ids, attention_masks = preprocessing_for_bert(texts, self.tokenizer, self.pad_size)
-        y = torch.LongTensor(label).to(self.device)
-        # pad前的长度(超过pad_size的设为pad_size)
-        #seq_len = torch.LongTensor([_[2] for _ in datas]).to(self.device)
-        return input_ids, attention_masks, y
-
-    def __next__(self):
-        if self.index >= self.n_batches:
-            self.index = 0
-            raise StopIteration
-        else:
-            batches = self.batches.get_chunk(self.batch_size)
-            self.index += 1
-            batches = self._to_tensor(list(batches['text']),list(batches['label']))
-            return batches
-
-    def __iter__(self):
-        return self
-
-    def __len__(self):
-        if self.residue:
-            return self.n_batches + 1
-        else:
-            return self.n_batches
 
 class BertClassifier(nn.Module):
     """Bert Model for Classification Tasks.
@@ -210,7 +171,7 @@ class BertClassifier(nn.Module):
         # Feed input to classifier to compute logits
         logits = self.classifier(last_hidden_state_cls)
 
-        return logits
+        return F.softmax(logits, dim=1)
 
 def train(model, train_dataloader, val_dataloader=None, optimizer=None, scheduler=None, epochs=4, evaluation=False,device=None,loss_fn=None):
     """Train the BertClassifier model.
@@ -222,6 +183,8 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if not loss_fn:
         loss_fn = nn.CrossEntropyLoss()
+
+    history_value = {"train":[],"eval":[]}
     logger.info("Start training...\n")
     for epoch_i in range(epochs):
         # =======================================
@@ -289,16 +252,21 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
         if evaluation == True:
             # After the completion of each training epoch, measure the model's performance
             # on our validation set.
-            val_loss, val_accuracy = evaluate(model, val_dataloader,device=device,loss_fn=loss_fn)
+            val_loss, val_accuracy, report, confusion = evaluate(model, val_dataloader,device=device,loss_fn=loss_fn)
 
             # Print performance over the entire training data
             time_elapsed = time.time() - t0_epoch
-
+            history_value["train"].append(avg_train_loss)
+            history_value["eval"].append(val_loss)
             logger.info(f"{epoch_i + 1:^7} | {'-':^7} | {avg_train_loss:^12.6f} | {val_loss:^10.6f} | {val_accuracy:^9.2f} | {time_elapsed:^9.2f}")
             logger.info("-"*70)
-        logger.info("\n")
-
+    logger.info("Precision, Recall and F1-Score...")
+    logger.info(str(report))
+    logger.info("Confusion Matrix...")
+    logger.info(str(confusion))
+    logger.info("\n")
     logger.info("Training complete!")
+    logger.info(str(history_value))
     return model
 
 
@@ -315,9 +283,10 @@ def evaluate(model, val_dataloader,device=None,loss_fn=None):
     model.eval()
 
     # Tracking variables
-    val_accuracy = []
+    val_accuracy = 0
     val_loss = []
-
+    predict_all = []
+    labels_all = []
     # For each batch in our validation set...
     for batch in val_dataloader:
         # Load batch to GPU
@@ -333,16 +302,20 @@ def evaluate(model, val_dataloader,device=None,loss_fn=None):
 
         # Get the predictions
         preds = torch.argmax(logits, dim=1).flatten()
+        predict_all = predict_all+preds.tolist()
+        labels_all = labels_all+b_labels.tolist()
 
         # Calculate the accuracy rate
-        accuracy = (preds == b_labels).cpu().numpy().mean() * 100
-        val_accuracy.append(accuracy)
+        #accuracy = (preds == b_labels).cpu().numpy().mean() * 100
+        #val_accuracy.append(accuracy)
 
     # Compute the average accuracy and loss over the validation set.
     val_loss = np.mean(val_loss)
-    val_accuracy = np.mean(val_accuracy)
-
-    return val_loss, val_accuracy
+    val_accuracy = (torch.tensor(predict_all) == torch.tensor(labels_all)).cpu().numpy().mean() * 100
+    target_names = [str(i) for i in sorted(list(set(labels_all)))]
+    report = metrics.classification_report(labels_all, predict_all, target_names=target_names, digits=4)
+    confusion = metrics.confusion_matrix(labels_all, predict_all)
+    return val_loss, val_accuracy, report, confusion
 
 def compute_metrics(pred):
     labels = pred.label_ids
@@ -352,6 +325,8 @@ def compute_metrics(pred):
     precision = sklearn.metrics.precision_score(y_true=labels, y_pred=pred)
     f1 = sklearn.metrics.f1_score(y_true=labels, y_pred=pred)
     return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
+
+
 
 def main():
     options = getOptions()
@@ -377,7 +352,6 @@ def main():
     bert_pretrain = options.pretrain
     max_length = options.pad_size
     batch_size = options.batch_size
-    class_list = options.class_list.split(',')
     epochs = options.num_epochs
     if not options.device:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -386,29 +360,38 @@ def main():
     train_path = options.train
     valid_path = options.eval
 
+    # load dataset
     traindf = pd.read_csv(train_path,sep='\t')
-    class_list = list(set(traindf['label']))
-    trainlen = len(traindf)
-    del traindf
     validdf = pd.read_csv(valid_path,sep='\t')
-    vallen = len(validdf)
-    del validdf
-
-
 
     # load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(bert_pretrain)
 
     # Run function `preprocessing_for_bert` on the train set and the validation set
     logger.info('Tokenizing data...')
+    tokenobj1_0_2 = cleanTokenv1_0_2()
+    wordfun = tokenobj1_0_2.cleanToken
+    train_inputs, train_masks = preprocessing_for_bert(list(traindf['text']), tokenizer, max_length,cutword=wordfun)
+    val_inputs, val_masks = preprocessing_for_bert(list(validdf['text']), tokenizer, max_length,cutword=wordfun)
 
-    train_iter = build_iterator(train_path, trainlen, tokenizer, max_length, batch_size, device)
-    dev_iter = build_iterator(valid_path, vallen, tokenizer, max_length, batch_size, device)
+    # Convert other data types to torch.Tensor
+    train_labels = torch.tensor(traindf['label'], device='cpu')
+    val_labels = torch.tensor(validdf['label'], device='cpu')
+
+    # Create the DataLoader for our training set
+    train_data = TensorDataset(train_inputs, train_masks, train_labels)
+    train_sampler = RandomSampler(train_data)
+    train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=batch_size)
+
+    # Create the DataLoader for our validation set
+    val_data = TensorDataset(val_inputs, val_masks, val_labels)
+    val_sampler = SequentialSampler(val_data)
+    val_dataloader = DataLoader(val_data, sampler=val_sampler, batch_size=batch_size)
 
     # load the model and pass to CUDA
     model = BertClassifier(model_path=bert_pretrain,
                            D_in=768, H=50,
-                           D_out=len(class_list),
+                           D_out=len(set(traindf['label'])),
                            freeze_bert=False).to(device)
 
 
@@ -419,17 +402,17 @@ def main():
                       )
 
     # Total number of training steps
-    total_steps = trainlen * epochs
+    total_steps = len(train_dataloader) * epochs
 
     # Set up the learning rate scheduler
     scheduler = get_linear_schedule_with_warmup(optimizer,
                                                 num_warmup_steps=0, # Default value
                                                 num_training_steps=total_steps)
 
-    model = train(model=model, train_dataloader=train_iter,
-                  val_dataloader=dev_iter,
-                  optimizer=optimizer, scheduler=scheduler,
-                  epochs=epochs, evaluation=True,device=device)
+    model = train(model=model, train_dataloader=train_dataloader,
+          val_dataloader=val_dataloader,
+          optimizer=optimizer, scheduler=scheduler,
+          epochs=epochs, evaluation=True,device=device)
     #model.save_pretrained('./%s/model' % runname)
     model.to(torch.device("cpu"))
     tokenizer.save_pretrained('./%s/model' % runname)

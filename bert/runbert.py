@@ -1,8 +1,10 @@
 # coding: UTF-8
-
+##########################################
+## bineray /multi-classification, df[label]=[0,1,2....]
+##########################################
 import torch
 import torch.nn as nn
-from transformers import BertModel
+import torch.nn.functional as F
 import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from transformers.file_utils import is_tf_available, is_torch_available, is_torch_tpu_available
@@ -21,7 +23,7 @@ import logging.config
 import os
 import sys
 import shutil
-
+from torch_ort import ORTModule
 ##########################################
 ## Options and defaults
 ##########################################
@@ -53,6 +55,10 @@ def text_preprocessing(text):
     text = re.sub(r'&amp;', '&', text)
     # Remove trailing whitespace
     text = re.sub(r'\s+', ' ', text).strip()
+    # remove urls
+    urls = re.findall('http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', text)
+    for u in urls:
+        text = text.replace(u, '')
     return text
 
 # Create a function to tokenize a set of texts
@@ -138,8 +144,7 @@ class BertClassifier(nn.Module):
                       num_labels)
         """
         # Feed input to BERT
-        outputs = self.bert(input_ids=input_ids,
-                            attention_mask=attention_mask)
+        outputs = self.bert(input_ids=input_ids,attention_mask=attention_mask)
 
         # Extract the last hidden state of the token `[CLS]` for classification task
         last_hidden_state_cls = outputs[0][:, 0, :]
@@ -147,7 +152,7 @@ class BertClassifier(nn.Module):
         # Feed input to classifier to compute logits
         logits = self.classifier(last_hidden_state_cls)
 
-        return logits
+        return F.softmax(logits, dim=1)
 
 def train(model, train_dataloader, val_dataloader=None, optimizer=None, scheduler=None, epochs=4, evaluation=False,device=None,loss_fn=None):
     """Train the BertClassifier model.
@@ -159,6 +164,8 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if not loss_fn:
         loss_fn = nn.CrossEntropyLoss()
+
+    history_value = {"train":[],"eval":[]}
     logger.info("Start training...\n")
     for epoch_i in range(epochs):
         # =======================================
@@ -230,7 +237,8 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
 
             # Print performance over the entire training data
             time_elapsed = time.time() - t0_epoch
-
+            history_value["train"].append(avg_train_loss)
+            history_value["eval"].append(val_loss)
             logger.info(f"{epoch_i + 1:^7} | {'-':^7} | {avg_train_loss:^12.6f} | {val_loss:^10.6f} | {val_accuracy:^9.2f} | {time_elapsed:^9.2f}")
             logger.info("-"*70)
     logger.info("Precision, Recall and F1-Score...")
@@ -239,6 +247,7 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
     logger.info(str(confusion))
     logger.info("\n")
     logger.info("Training complete!")
+    logger.info(str(history_value))
     return model
 
 
@@ -362,7 +371,7 @@ def main():
                            D_out=len(set(traindf['label'])),
                            freeze_bert=False).to(device)
 
-
+    model = ORTModule(model)
     # Create the optimizer
     optimizer = AdamW(model.parameters(),
                       lr=5e-5,    # Default learning rate
@@ -388,6 +397,31 @@ def main():
     with open('./%s/model/model.pkl' % runname,'wb') as mf:
         pickle.dump(model,mf)
     torch.save(model.state_dict(), './%s/model/weight.ckpt' % runname)
+
+    encoded_sent = tokenizer.encode_plus(
+        text=text_preprocessing("test text"),  # Preprocess sentence
+        add_special_tokens=True,        # Add `[CLS]` and `[SEP]`
+        max_length=max_length,                  # Max length to truncate/pad
+        padding='max_length',         # Pad sentence to max length
+        truncation=True,
+        return_tensors='pt',           # Return PyTorch tensor
+        return_attention_mask=True      # Return attention mask
+    )
+    #cpudevice = torch.device("cpu")
+    input_ids = encoded_sent.get('input_ids').int().to(device)
+    attention_masks = encoded_sent.get('attention_mask').int().to(device)
+    #jit_sample = (input_ids, input_ids)
+
+    torch.onnx.export(model.eval().to(device)  # model being run
+                      ,(input_ids, attention_masks)
+                      ,f='./%s/model/model.onnx' % runname
+                      ,input_names = ["input_ids", "attention_mask"]
+                      ,output_names = ["output"]
+                      ,dynamic_axes = {
+                            'input_ids': {0: 'batch_size', 1: 'length'}, 'attention_mask': {0: 'batch_size', 1: 'length'},
+                            'output': {0: 'batch_size'}}
+                      ,opset_version=11
+                      )
 
 if __name__ == "__main__":
     main()

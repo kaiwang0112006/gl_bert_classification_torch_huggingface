@@ -1,5 +1,9 @@
 # coding: UTF-8
-
+##########################################
+#  multi-target multi-output classification,
+# df[y1]=[[0,1,1....],[1,0,1....]]
+#  df[y2]=[[0,1,0....],[0,0,1....]]
+##########################################
 import torch
 import torch.nn as nn
 from transformers import BertModel
@@ -8,7 +12,6 @@ import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from transformers.file_utils import is_tf_available, is_torch_available, is_torch_tpu_available
 from transformers import *
-from torch_ort import ORTModule
 import numpy as np
 import random
 import sklearn.metrics
@@ -21,6 +24,7 @@ import shutil
 import os
 import logging
 import sys
+from torch_ort import ORTModule
 ##########################################
 ## Options and defaults
 ##########################################
@@ -154,13 +158,14 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if not loss_fn:
         loss_fn = nn.CrossEntropyLoss()
+    history_value = {"train": [], "eval": [], "eval_y1":[], "eval_y2":[]}
     logger.info("Start training...\n")
     for epoch_i in range(epochs):
         # =======================================
         #               Training
         # =======================================
         # Print the header of the result table
-        logger.info(f"{'Epoch':^7} | {'Batch':^7} | {'Train Loss':^12} | {'Val Loss':^10} | {'Val Acc':^9} | {'Elapsed':^9}")
+        logger.info(f"{'Epoch':^7} | {'Batch':^7} | {'Train Loss':^12} | {'Train y1 Loss':^12} | {'Train y2 Loss':^12} | {'Val Loss':^10} | {'Val y1 Loss':^10} | {'Val y2 Loss':^10} | {'Val Acc':^9} | {'Val y1 Acc':^9} | {'Val y2 Acc':^9} | {'Elapsed':^9}")
         logger.info("-"*70)
 
         # Measure the elapsed time of each epoch
@@ -168,7 +173,7 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
 
         # Reset tracking variables at the beginning of each epoch
         total_loss, batch_loss, batch_counts = 0, 0, 0
-
+        y1_total_loss, y2_total_loss, y1_batch_loss, y2_batch_loss = 0,0,0,0
         # Put the model into the training mode
         model.train()
 
@@ -185,8 +190,15 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
             logits = model(b_input_ids, b_attn_mask)
             # Compute loss and accumulate the loss values
             loss = 0
-            for i in range(len(logits)):
-                loss += loss_fn(logits[i], b_labels[i])
+            y1_loss = loss_fn(logits[0], b_labels[0])
+            y2_loss = loss_fn(logits[1], b_labels[1])
+            for i in [y1_loss, y2_loss]:
+                loss += i
+            y1_total_loss += y1_loss
+            y2_total_loss += y2_loss
+            y1_batch_loss += y1_loss
+            y2_batch_loss += y2_loss
+
             loss = loss/len(logits)
             batch_loss += loss.item()
             total_loss += loss.item()
@@ -204,14 +216,17 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
                 time_elapsed = time.time() - t0_batch
 
                 # Print training results
-                logger.info(f"{epoch_i + 1:^7} | {step:^7} | {batch_loss / batch_counts:^12.6f} | {'-':^10} | {'-':^9} | {time_elapsed:^9.2f}")
+                logger.info(f"{epoch_i + 1:^7} | {step:^7} | {batch_loss / batch_counts:^12.6f} | {y1_batch_loss / batch_counts:^13.6f} | {y2_batch_loss / batch_counts:^13.6f} | {'-':^10} | {'-':^11} | {'-':^11} | {'-':^9} | {'-':^10} | {'-':^10} | {time_elapsed:^9.2f}")
 
                 # Reset batch tracking variables
                 batch_loss, batch_counts = 0, 0
+                y1_batch_loss, y2_batch_loss = 0,0
                 t0_batch = time.time()
 
         # Calculate the average loss over the entire training data
         avg_train_loss = total_loss / len(train_dataloader)
+        y1_avg_train_loss = y1_total_loss / len(train_dataloader)
+        y2_avg_train_loss = y2_total_loss / len(train_dataloader)
 
         logger.info("-"*70)
         # =======================================
@@ -220,18 +235,22 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
         if evaluation == True:
             # After the completion of each training epoch, measure the model's performance
             # on our validation set.
-            val_loss, val_accuracy,reports = evaluate(model, val_dataloader,device=device,loss_fn=loss_fn,class_name=class_name)
+            val_loss, val_loss_list, val_accuracy, val_accuracy_list,reports = evaluate(model, val_dataloader,device=device,loss_fn=loss_fn,class_name=class_name)
 
             # Print performance over the entire training data
             time_elapsed = time.time() - t0_epoch
-
-            logger.info(f"{epoch_i + 1:^7} | {'-':^7} | {avg_train_loss:^12.6f} | {val_loss:^10.6f} | {val_accuracy:^9.2f} | {time_elapsed:^9.2f}")
+            history_value["train"].append(avg_train_loss)
+            history_value["eval"].append(val_loss)
+            history_value["eval_y1"].append(val_loss_list[0])
+            history_value["eval_y2"].append(val_loss_list[1])
+            logger.info(f"{epoch_i + 1:^7} | {'-':^7} | {avg_train_loss:^12.6f} | {y1_avg_train_loss:^13.6f} | {y2_avg_train_loss:^13.6f} | {val_loss:^10.6f} | {val_loss_list[0]:^11.6f} | {val_loss_list[1]:^11.6f} | {val_accuracy:^9.2f} | {val_accuracy_list[0]:^10.2f} | {val_accuracy_list[1]:^10.2f} | {time_elapsed:^9.2f}")
             logger.info("-"*70)
         logger.info("\n")
     logger.info("Precision, Recall and F1-Score...")
     for report in reports:
         logger.info(str(report))
     logger.info("Training complete!")
+    logger.info(str(history_value))
     return model
 
 def evaluate(model, val_dataloader,device=None,loss_fn=None,class_name=""):
@@ -247,8 +266,8 @@ def evaluate(model, val_dataloader,device=None,loss_fn=None,class_name=""):
     model.eval()
 
     # Tracking variables
-    val_accuracy = []
-    val_loss = []
+    val_accuracy_list = []
+    val_loss_list = []
     labels_all = [[] for i in class_name]
     predict_all = [[] for i in class_name]
     # For each batch in our validation set...
@@ -262,7 +281,7 @@ def evaluate(model, val_dataloader,device=None,loss_fn=None,class_name=""):
         # Compute loss
         for i in range(len(logits)):
             loss = loss_fn(logits[i], b_labels[i])
-            val_loss.append(loss.item())
+            val_loss_list.append(loss.item())
 
             # Get the predictions
             logits[i][logits[i] >= 0.5] = 1
@@ -270,20 +289,20 @@ def evaluate(model, val_dataloader,device=None,loss_fn=None,class_name=""):
 
             # Calculate the accuracy rate
             accuracy = (logits[i] == b_labels[i]).sum().cpu() / (logits[i].size()[0]*logits[i].size()[1]) * 100
-            val_accuracy.append(accuracy)
+            val_accuracy_list.append(accuracy)
             predict_all[i] = predict_all[i] +logits[i].tolist()
             labels_all[i] = labels_all[i] +b_labels[i].tolist()
 
     # Compute the average accuracy and loss over the validation set.
-    val_loss = np.mean(val_loss)
-    val_accuracy = np.mean(val_accuracy)
+    val_loss = np.mean(val_loss_list)
+    val_accuracy = np.mean(val_accuracy_list)
 
     reports = []
     for i in range(len(labels_all)):
         report = sklearn.metrics.classification_report(labels_all[i], predict_all[i], digits=4)
         reports.append(report)
 
-    return val_loss, val_accuracy,reports
+    return val_loss, val_loss_list, val_accuracy, val_accuracy_list, reports
 
 def compute_metrics(pred):
     labels = pred.label_ids
