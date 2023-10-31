@@ -2,7 +2,6 @@
 
 import torch
 import torch.nn as nn
-from transformers import BertModel
 import torch.nn.functional as F
 import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
@@ -58,7 +57,7 @@ def text_preprocessing(text):
     return text
 
 # Create a function to tokenize a set of texts
-def preprocessing_for_bert(textdata, tokenizer, pad):
+def preprocessing_for_bert(text1, text2, tokenizer, pad):
     """Perform required preprocessing steps for pretrained BERT.
     @param    data (np.array): Array of texts to be processed.
     @return   input_ids (torch.Tensor): Tensor of token ids to be fed to a model.
@@ -68,38 +67,32 @@ def preprocessing_for_bert(textdata, tokenizer, pad):
     # Create empty lists to store outputs
     input_ids = []
     attention_masks = []
+    token_type_ids = []
+    offset_mapping = []
+    sequence_ids = []
     # For every sentence...
-    for sent in textdata:
-        # `encode_plus` will:
-        #    (1) Tokenize the sentence
-        #    (2) Add the `[CLS]` and `[SEP]` token to the start and end
-        #    (3) Truncate/Pad sentence to max length
-        #    (4) Map tokens to their IDs
-        #    (5) Create attention mask
-        #    (6) Return a dictionary of outputs
-        encoded_sent = tokenizer.encode_plus(
-            text=text_preprocessing(sent),  # Preprocess sentence
-            add_special_tokens=True,        # Add `[CLS]` and `[SEP]`
-            max_length=pad,                  # Max length to truncate/pad
-            padding='max_length',         # Pad sentence to max length
+    for i in range(len(text1)):
+        tokenized = tokenizer(
+            text_preprocessing(str(text1[i])),
+            text_preprocessing(str(text2[i])),
             truncation=True,
-            return_tensors='pt',           # Return PyTorch tensor
-            return_attention_mask=True      # Return attention mask
+            max_length=pad,
+            padding="max_length",
+            return_offsets_mapping=True
         )
 
-        # Add the outputs to the lists
-        input_ids.append(encoded_sent.get('input_ids').tolist()[0])
-        attention_masks.append(encoded_sent.get('attention_mask').tolist()[0])
-        # try:
-        #     torch.tensor(input_ids)
-        # except:
-        #     print(input_ids)
-        #     raise
-    # Convert lists to tensors
-    input_ids = torch.tensor(input_ids)
-    attention_masks = torch.tensor(attention_masks)
+        tokenized["sequence_ids"] = tokenized.sequence_ids()
 
-    return input_ids, attention_masks
+        # Add the outputs to the lists
+        input_ids.append(tokenized["input_ids"])
+        attention_masks.append(tokenized["attention_mask"])
+        token_type_ids.append(tokenized["token_type_ids"])
+        offset_mapping.append(tokenized["offset_mapping"])
+        sequence_ids.append(tokenized["sequence_ids"])
+
+
+    return torch.tensor(input_ids), torch.tensor(attention_masks), torch.tensor(token_type_ids), offset_mapping, sequence_ids
+
 
 class BertClassifier(nn.Module):
     """Bert Model for Classification Tasks.
@@ -113,7 +106,8 @@ class BertClassifier(nn.Module):
         super(BertClassifier, self).__init__()
 
         # Instantiate BERT model
-        self.bert = BertModel.from_pretrained(model_path)
+        #self.bert = AutoModelForMaskedLM.from_pretrained(model_path)
+        self.bert = AutoModel.from_pretrained(model_path)
 
         # Instantiate an one-layer feed-forward classifier
         self.classifier=nn.Linear(self.bert.config.hidden_size,n_classes)
@@ -123,7 +117,7 @@ class BertClassifier(nn.Module):
             for param in self.bert.parameters():
                 param.requires_grad = False
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask,token_type_ids):
         """
         Feed input to BERT and the classifier to compute logits.
         @param    input_ids (torch.Tensor): an input tensor with shape (batch_size,
@@ -135,7 +129,8 @@ class BertClassifier(nn.Module):
         """
         # Feed input to BERT
         outputs = self.bert(input_ids=input_ids,
-                            attention_mask=attention_mask)
+                            attention_mask=attention_mask,
+                            token_type_ids=token_type_ids)
 
         # Feed input to classifier to compute logits
         logits = self.classifier(outputs.pooler_output)
@@ -174,13 +169,12 @@ def train(model, train_dataloader, val_dataloader=None, optimizer=None, schedule
         for step, batch in enumerate(train_dataloader):
             batch_counts +=1
             # Load batch to GPU
-            b_input_ids, b_attn_mask, b_labels = tuple(t.to(device) for t in batch)
-
+            b_inputs, b_masks, b_token_type_ids, b_labels = tuple(t.to(device) for t in batch)
             # Zero out any previously calculated gradients
             model.zero_grad()
 
             # Perform a forward pass. This will return logits.
-            logits = model(b_input_ids, b_attn_mask)
+            logits = model(b_inputs, b_masks, b_token_type_ids)
             output_sig = torch.sigmoid(logits)
             # Compute loss and accumulate the loss values
             loss = loss_fn(output_sig, b_labels)
@@ -254,11 +248,11 @@ def evaluate(model, val_dataloader,device=None,loss_fn=None,class_name=[]):
     # For each batch in our validation set...
     for batch in val_dataloader:
         # Load batch to GPU
-        b_input_ids, b_attn_mask, b_labels = tuple(t.to(device) for t in batch)
+        b_input_ids, b_attn_mask, b_token_type_ids, b_labels = tuple(t.to(device) for t in batch)
 
         # Compute logits and preds
         with torch.no_grad():
-            logits = model(b_input_ids, b_attn_mask)
+            logits = model(b_input_ids, b_attn_mask, b_token_type_ids)
         output_sig = torch.sigmoid(logits)
         pred = output_sig.argmax(-1).cpu().numpy().tolist()
         labels = b_labels.argmax(-1).cpu().numpy().tolist()
@@ -288,65 +282,6 @@ def evaluate(model, val_dataloader,device=None,loss_fn=None,class_name=[]):
     #report = None
     return val_loss, val_accuracy, report
 
-def __evaluate(model, val_dataloader,device=None,loss_fn=None,class_name=[]):
-    """After the completion of each training epoch, measure the model's performance
-    on our validation set.
-    """
-    # Put the model into the evaluation mode. The dropout layers are disabled during
-    # the test time.
-    if not device:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if not loss_fn:
-        loss_fn = nn.CrossEntropyLoss()
-    model.eval()
-
-    # Tracking variables
-    val_accuracy = []
-    val_loss = []
-    labels_all = []
-    predict_all = []
-    # For each batch in our validation set...
-    for batch in val_dataloader:
-        # Load batch to GPU
-        b_input_ids, b_attn_mask, b_labels = tuple(t.to(device) for t in batch)
-
-        # Compute logits
-        with torch.no_grad():
-            logits = model(b_input_ids, b_attn_mask)
-        output_sig = torch.sigmoid(logits)
-
-        # Compute loss
-        loss = loss_fn(output_sig, b_labels)
-        val_loss.append(loss.item())
-
-        # Get the predictions
-        logits[logits >= 0.5] = 1
-        logits[logits < 0.5] = 0
-
-        # Calculate the accuracy rate
-        accuracy = (logits == b_labels).sum().cpu() / (logits.size()[0]*logits.size()[1]) * 100
-        val_accuracy.append(accuracy)
-        predict_all = predict_all+logits.tolist()
-        labels_all = labels_all+b_labels.tolist()
-
-    # Compute the average accuracy and loss over the validation set.
-    val_loss = np.mean(val_loss)
-    val_accuracy = np.mean(val_accuracy)
-    target_names = [str(i) for i in labels_all[0]]
-    if class_name:
-        target_names = [class_name[i] for i in range(len(target_names))]
-    report = sklearn.metrics.classification_report(labels_all, predict_all, target_names=target_names, digits=4)
-    return val_loss, val_accuracy,report
-
-def compute_metrics(pred):
-    labels = pred.label_ids
-    preds = pred.predictions.argmax(-1)
-    accuracy = sklearn.metrics.accuracy_score(y_true=labels, y_pred=pred)
-    recall = sklearn.metrics.recall_score(y_true=labels, y_pred=pred)
-    precision = sklearn.metrics.precision_score(y_true=labels, y_pred=pred)
-    f1 = sklearn.metrics.f1_score(y_true=labels, y_pred=pred)
-    return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
-
 def main():
     options = getOptions()
     print(options)
@@ -354,7 +289,7 @@ def main():
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     runname = options.run
-    if  os.path.exists(runname):
+    if os.path.exists(runname):
         shutil.rmtree(runname)
     os.mkdir(runname)
     logger = logging.getLogger()
@@ -396,20 +331,19 @@ def main():
 
     # Run function `preprocessing_for_bert` on the train set and the validation set
     logger.info('Tokenizing data...')
-    train_inputs, train_masks = preprocessing_for_bert(list(traindf['text']), tokenizer, max_length)
-    val_inputs, val_masks = preprocessing_for_bert(list(validdf['text']), tokenizer, max_length)
-
+    train_inputs, train_masks, train_token_type_ids, train_offset_mapping, train_sequence_ids = preprocessing_for_bert(list(traindf['question']),list(traindf['answer']), tokenizer, max_length)
+    val_inputs, val_masks, val_token_type_ids, val_offset_mapping, val_sequence_ids = preprocessing_for_bert(list(validdf['question']),list(traindf['answer']), tokenizer, max_length)
     # Convert other data types to torch.Tensor
     train_labels = torch.FloatTensor(traindf['label'].apply(lambda x:eval(x)))
     val_labels = torch.FloatTensor(validdf['label'].apply(lambda x:eval(x)))
 
     # Create the DataLoader for our training set
-    train_data = TensorDataset(train_inputs, train_masks, train_labels)
+    train_data = TensorDataset(train_inputs, train_masks, train_token_type_ids, train_labels)
     train_sampler = RandomSampler(train_data)
     train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=batch_size)
 
     # Create the DataLoader for our validation set
-    val_data = TensorDataset(val_inputs, val_masks, val_labels)
+    val_data = TensorDataset(val_inputs, val_masks, val_token_type_ids, val_labels)
     val_sampler = SequentialSampler(val_data)
     val_dataloader = DataLoader(val_data, sampler=val_sampler, batch_size=batch_size)
     n_classes = len(list(train_labels)[0])

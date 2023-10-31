@@ -2,7 +2,6 @@
 
 import torch
 import torch.nn as nn
-from transformers import BertModel
 import torch.nn.functional as F
 import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
@@ -113,7 +112,7 @@ class BertClassifier(nn.Module):
         super(BertClassifier, self).__init__()
 
         # Instantiate BERT model
-        self.bert = BertModel.from_pretrained(model_path)
+        self.bert = AutoModelForMaskedLM.from_pretrained(model_path)
 
         # Instantiate an one-layer feed-forward classifier
         self.classifier=nn.Linear(self.bert.config.hidden_size,n_classes)
